@@ -1,4 +1,6 @@
-# LocalLLMSwingAgent
+# Local LLM tool 
+
+Support direct file creation 
 
 A standalone Java Swing desktop client for interacting with a locally hosted LLM through an OpenAI-compatible API such as LM Studio.
 
@@ -16,6 +18,11 @@ The application is designed as a lightweight local AI coding/document agent with
 - Cancellation of in-progress LLM operations
 - Conversation history
 - Configurable model, endpoint, temperature and token limit
+
+
+<img width="1187" height="773" alt="image" src="https://github.com/user-attachments/assets/9231baf8-f8d1-4dce-a479-ca34fea20f78" />
+
+
 
 ## Requirements
 
