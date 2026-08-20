@@ -17,6 +17,8 @@ javac %1
 echo making jar %filename%.jar
 jar --create --file %filename%.jar --main-class %filename% *.class
 
+del *.class
+
 echo running %filename%.jar
 java -jar %filename%.jar
 
