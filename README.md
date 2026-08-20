@@ -20,7 +20,8 @@ The application is designed as a lightweight local AI coding/document agent with
 - Configurable model, endpoint, temperature and token limit
 
 
-<img width="1187" height="773" alt="image" src="https://github.com/user-attachments/assets/9231baf8-f8d1-4dce-a479-ca34fea20f78" />
+<img width="1186" height="774" alt="image" src="https://github.com/user-attachments/assets/46025c86-32d0-49db-a7bd-bf63bb92b59c" />
+
 
 
 
