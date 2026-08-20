@@ -59,7 +59,7 @@ import java.util.regex.Pattern;
  *
  * The application writes the file directly beneath the selected workspace.
  */
-public class LocalLLMSwingAgentV6 extends JFrame {
+public class LocalLLMSwingAgentV10 extends JFrame {
 
     // ---------- UI ----------
     private final JTextArea chatArea = new JTextArea();
@@ -89,6 +89,28 @@ public class LocalLLMSwingAgentV6 extends JFrame {
     private final List<Path> attachedFiles = new ArrayList<>();
     private static final int MAX_CONTEXT_CHARS = 1_500_000;
     private static final int MAX_IMAGE_BYTES = 15_000_000;
+    private volatile int modelContextTokens = 8192;
+    private volatile String detectedContextModel = "";
+    private final StringBuilder streamedFileBuffer = new StringBuilder();
+    private final Set<String> streamedWrittenFiles =
+            Collections.synchronizedSet(new LinkedHashSet<>());
+
+    /*
+     * The parser intentionally accepts small variations because local models
+     * are not guaranteed to reproduce whitespace exactly.
+     *
+     * Supported:
+     *   <<<FILE:path>>>
+     *   <<<FILE: path >>>
+     *   <<<FILE path>>>
+     * and the corresponding <<<END_FILE>>> marker.
+     */
+    private static final Pattern FILE_BLOCK_PATTERN = Pattern.compile(
+            "(?is)<<<\\s*FILE\\s*:?\\s*(.*?)\\s*>>>\\s*(.*?)\\s*<<<\\s*END[_ ]?FILE\\s*>>>"
+    );
+
+    private final JLabel contextLabel = new JLabel("Context: detecting...");
+
 
 
     private final JList<String> fileList = new JList<>(fileListModel);
@@ -145,7 +167,7 @@ public class LocalLLMSwingAgentV6 extends JFrame {
             "<<<FILE\\s*:\\s*(.*?)\\s*>>>\\s*\\R([\\s\\S]*?)\\R\\s*<<<END_FILE\\s*>>>",
             Pattern.MULTILINE);
 
-    public LocalLLMSwingAgentV6() {
+    public LocalLLMSwingAgentV10() {
         super("Local LLM Swing Agent - Direct File Generation");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setMinimumSize(new Dimension(1200, 780));
@@ -184,7 +206,11 @@ public class LocalLLMSwingAgentV6 extends JFrame {
         operationCancelButton.setPreferredSize(new Dimension(90, 28));
         operationCancelButton.addActionListener(e -> cancelCurrentOperation());
 
-        operationBar.add(operationLabel, BorderLayout.WEST);
+        JPanel operationInfo = new JPanel(new GridLayout(2, 1, 0, 1));
+        operationInfo.add(operationLabel);
+        contextLabel.setFont(contextLabel.getFont().deriveFont(Font.PLAIN, 11f));
+        operationInfo.add(contextLabel);
+        operationBar.add(operationInfo, BorderLayout.WEST);
         operationBar.add(operationProgress, BorderLayout.CENTER);
         operationBar.add(operationCancelButton, BorderLayout.EAST);
 
@@ -395,6 +421,24 @@ public class LocalLLMSwingAgentV6 extends JFrame {
 
     // ---------- Chat ----------
 
+    private boolean looksLikeFileGenerationRequest(String text) {
+        if (text == null) return false;
+        String t = text.toLowerCase(Locale.ROOT);
+
+        return t.contains("create file")
+                || t.contains("create files")
+                || t.contains("generate file")
+                || t.contains("generate files")
+                || t.contains("write file")
+                || t.contains("write files")
+                || t.contains("update file")
+                || t.contains("modify file")
+                || t.contains("create project")
+                || t.contains("generate project")
+                || t.contains("implement this")
+                || t.contains("implement the");
+    }
+
     private void sendMessage() {
         if (busy) return;
 
@@ -415,6 +459,11 @@ public class LocalLLMSwingAgentV6 extends JFrame {
 
         inputArea.setText("");
         String messageWithAttachments = buildMessageWithAttachments(text);
+        if (looksLikeFileGenerationRequest(text)) {
+            messageWithAttachments += "\n\nSYSTEM AGENT NOTE: This request requires direct local file generation. "
+                    + "Do NOT paste generated source files as ordinary chat content. "
+                    + "Emit each file using <<<FILE:relative/path>>> ... <<<END_FILE>>>."; 
+        }
         appendUser(messageWithAttachments);
         addMessage("user", messageWithAttachments);
         cancelRequested = false;
@@ -434,13 +483,50 @@ public class LocalLLMSwingAgentV6 extends JFrame {
                         return;
                     }
 
-                    int written = writeFileBlocks(response, workspace);
-                    if (written > 0) {
-                        appendSystem("Wrote/updated " + written + " file(s) in " + workspace);
+                    FileWriteResult fileResult = writeFileBlocksSafe(response, workspace);
+
+                    String chatResponse = removeFileBlocksForChat(response);
+
+                    if (fileResult.count() > 0 || !streamedWrittenFiles.isEmpty()) {
+                        chatResponse = chatResponse.trim();
+                        if (!chatResponse.isEmpty()) {
+                            chatResponse += "\n\n";
+                        }
+
+                        chatResponse += "Files generated/updated:\n";
+                        LinkedHashSet<String> allWritten =
+                                new LinkedHashSet<>(streamedWrittenFiles);
+                        for (Path file : fileResult.files)
+                            allWritten.add(file.toAbsolutePath().normalize().toString());
+
+                        for (String absolute : allWritten) {
+                            try {
+                                chatResponse += "✓ "
+                                        + workspace.relativize(Paths.get(absolute))
+                                        + "\n";
+                            } catch (Exception ignored) {
+                                chatResponse += "✓ " + absolute + "\n";
+                            }
+                        }
+
+                        chatResponse += "\nWorkspace: " + workspace;
                         refreshWorkspace();
                     }
 
+                    if (fileResult.errors.size() > 0) {
+                        chatResponse += "\n\nFile generation status:\n";
+                        for (String error : fileResult.errors) {
+                            chatResponse += "• " + error + "\n";
+                        }
+                    }
+
+                    // Store the complete response for future conversation context,
+                    // but display only the human-readable response and file summary.
                     addMessage("assistant", response);
+
+                    removeLastStreamingOutput();
+                    appendAssistant(chatResponse);
+
                     clearAttachments();
                     stopProgressIndicator("Ready");
                     setBusy(false, "Ready");
@@ -465,12 +551,164 @@ public class LocalLLMSwingAgentV6 extends JFrame {
         });
     }
 
+    private void refreshModelContext(String model) {
+        if (model == null || model.isBlank()) return;
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                String endpoint = normalizeEndpoint(endpointField.getText());
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(endpoint + "/models"))
+                        .timeout(Duration.ofSeconds(5))
+                        .header("Accept", "application/json")
+                        .GET()
+                        .build();
+
+                HttpResponse<String> response = httpClient.send(
+                        request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+
+                int detected = findContextLength(response.body(), model);
+
+                if (detected > 0) {
+                    modelContextTokens = detected;
+                    detectedContextModel = model;
+                    SwingUtilities.invokeLater(() ->
+                            contextLabel.setText("Context: " + formatTokenCount(detected) + " tokens"));
+                } else {
+                    SwingUtilities.invokeLater(() ->
+                            contextLabel.setText("Context: server did not report it"));
+                }
+            } catch (Exception e) {
+                SwingUtilities.invokeLater(() ->
+                        contextLabel.setText("Context: unavailable"));
+            }
+        });
+    }
+
+    private int findContextLength(String json, String model) {
+        // Look for the selected model's object first.
+        int modelPos = json.indexOf("\"id\":\"" + model + "\"");
+        if (modelPos < 0) modelPos = json.indexOf("\"id\": \"" + model + "\"");
+
+        String candidate = json;
+        if (modelPos >= 0) {
+            int start = json.lastIndexOf('{', modelPos);
+            int end = findMatchingObjectEnd(json, start);
+            if (start >= 0 && end > start) candidate = json.substring(start, end + 1);
+        }
+
+        String[] keys = {
+                "context_length", "contextLength",
+                "max_context_length", "maxContextLength",
+                "n_ctx", "n_ctx_train",
+                "max_model_len", "max_position_embeddings"
+        };
+
+        for (String key : keys) {
+            Integer value = findNumericProperty(candidate, key);
+            if (value != null && value > 0 && value <= 10_000_000) return value;
+        }
+
+        for (String key : keys) {
+            Integer value = findNumericProperty(json, key);
+            if (value != null && value > 0 && value <= 10_000_000) return value;
+        }
+
+        return 0;
+    }
+
+    private Integer findNumericProperty(String json, String key) {
+        Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*(\\d+)")
+                .matcher(json);
+        if (!m.find()) return null;
+        try { return Integer.parseInt(m.group(1)); }
+        catch (NumberFormatException e) { return null; }
+    }
+
+    private int findMatchingObjectEnd(String json, int start) {
+        if (start < 0) return -1;
+        int depth=0;
+        boolean quoted=false, escaped=false;
+
+        for (int i=start;i<json.length();i++) {
+            char c=json.charAt(i);
+            if (quoted) {
+                if (escaped) escaped=false;
+                else if (c=='\\') escaped=true;
+                else if (c=='"') quoted=false;
+                continue;
+            }
+            if (c=='"') quoted=true;
+            else if (c=='{') depth++;
+            else if (c=='}') {
+                depth--;
+                if (depth==0) return i;
+            }
+        }
+        return -1;
+    }
+
+    private String formatTokenCount(int tokens) {
+        if (tokens >= 1_000_000)
+            return String.format(Locale.ROOT, "%.1fM", tokens/1_000_000.0);
+        if (tokens >= 1000)
+            return String.format(Locale.ROOT, "%.1fK", tokens/1000.0);
+        return Integer.toString(tokens);
+    }
+
+    private int estimateTokens(String text) {
+        if (text == null || text.isEmpty()) return 0;
+
+        int chars=text.length();
+        int nonAscii=0;
+        for (int i=0;i<chars;i++) if (text.charAt(i)>127) nonAscii++;
+
+        double charsPerToken = nonAscii > chars/10 ? 2.2 : 3.2;
+        return Math.max(1, (int)Math.ceil((chars/charsPerToken)*1.10));
+    }
+
+    private int estimateConversationTokens() {
+        int total=estimateTokens(SYSTEM_PROMPT);
+        for (Map<String,String> m:messages)
+            total += estimateTokens(m.get("content")) + 8;
+        return total;
+    }
+
+    private int getAttachmentTokenBudget() {
+        int context=Math.max(modelContextTokens,2048);
+        int conversation=estimateConversationTokens();
+        int output=((Number)maxTokensSpinner.getValue()).intValue();
+
+        int available=context-conversation-output-512;
+        return Math.max(0,available);
+    }
+
+    private int tokenBudgetToChars(int tokens) {
+        return Math.max(0,(int)Math.min(Integer.MAX_VALUE,
+                Math.ceil(tokens*3.0)));
+    }
+
     private String callChatCompletion(String model) throws Exception {
         String endpoint = normalizeEndpoint(endpointField.getText());
         String url = endpoint + "/chat/completions";
 
         List<Map<String, String>> requestMessages = new ArrayList<>();
-        requestMessages.add(Map.of("role", "system", "content", SYSTEM_PROMPT));
+        Path currentWorkspace = getWorkspace();
+        String fileProtocol =
+                SYSTEM_PROMPT
+                + "\n\nCURRENT WORKSPACE:\n"
+                + currentWorkspace
+                + "\n\nFILE GENERATION PROTOCOL:\n"
+                + "When creating or updating files, output each file using exactly:\n"
+                + "<<<FILE:path/to/file.ext>>>\n"
+                + "complete file contents\n"
+                + "<<<END_FILE>>>\n"
+                + "Do not use markdown fences around FILE blocks. "
+                + "The desktop agent WILL write every FILE block directly to the selected workspace. "
+                + "If the user asks for files, you MUST use FILE blocks; do not merely paste source code "
+                + "in the normal response. After the FILE blocks, provide only a short summary. "
+                + "Do not say that the user needs to copy the code manually.";
+        requestMessages.add(Map.of("role", "system", "content", fileProtocol));
         requestMessages.addAll(messages);
 
         StringBuilder json = new StringBuilder();
@@ -514,6 +752,8 @@ public class LocalLLMSwingAgentV6 extends JFrame {
 
         StringBuilder completeResponse = new StringBuilder();
         boolean streamStarted = false;
+        streamedFileBuffer.setLength(0);
+        streamedWrittenFiles.clear();
 
         // Tell the user immediately that the HTTP request has actually been sent.
         SwingUtilities.invokeLater(() ->
@@ -660,17 +900,227 @@ public class LocalLLMSwingAgentV6 extends JFrame {
         return json.substring(start);
     }
 
-    private void appendStreamingText(String text) {
-        SwingUtilities.invokeLater(() -> {
-            if (cancelRequested) return;
 
-            chatArea.append(text);
-            chatArea.setCaretPosition(chatArea.getDocument().getLength());
+    private void processStreamingFileBlocks() {
+        Path workspace = getWorkspaceForWorker();
+        if (workspace == null) return;
 
-            long elapsed = System.currentTimeMillis() - operationStartMillis;
-            operationLabel.setText(
-                    "LLM is generating...  " + formatElapsed(elapsed));
+        while (true) {
+            String buffer = streamedFileBuffer.toString();
+            int start = findFileStart(buffer, 0);
+            if (start < 0) {
+                if (buffer.length() > 128)
+                    streamedFileBuffer.delete(0, buffer.length() - 128);
+                return;
+            }
+
+            int headerEnd = buffer.indexOf(">>>", start);
+            if (headerEnd < 0) {
+                if (start > 0) streamedFileBuffer.delete(0, start);
+                return;
+            }
+
+            String relative = buffer.substring(start + 7, headerEnd).trim();
+            int end = findEndFileMarker(buffer, headerEnd + 3);
+            if (end < 0) {
+                if (start > 0) streamedFileBuffer.delete(0, start);
+                return;
+            }
+
+            String content = buffer.substring(headerEnd + 3, end);
+            streamedFileBuffer.delete(0, end + 14);
+            writeStreamingFile(workspace, relative, content);
+        }
+    }
+
+    private int findFileStart(String s, int from) {
+        String u=s.toUpperCase(Locale.ROOT);
+        int a=u.indexOf("<<<FILE:",from), b=u.indexOf("<<<FILE ",from);
+        if(a<0)return b; if(b<0)return a; return Math.min(a,b);
+    }
+
+    private int findEndFileMarker(String s, int from) {
+        String u=s.toUpperCase(Locale.ROOT);
+        int a=u.indexOf("<<<END_FILE>>>",from), b=u.indexOf("<<<END FILE>>>",from);
+        if(a<0)return b; if(b<0)return a; return Math.min(a,b);
+    }
+
+    private Path getWorkspaceForWorker() {
+        try {
+            Path p=Paths.get(workspaceField.getText().trim()).toAbsolutePath().normalize();
+            if(!Files.exists(p)) Files.createDirectories(p);
+            return Files.isDirectory(p)?p:null;
+        } catch(Exception e){ return null; }
+    }
+
+    private void writeStreamingFile(Path workspace,String relative,String content) {
+        relative=relative.replaceAll("^[\"'`]+|[\"'`]+$","").trim();
+        if(relative.isEmpty()){ showFileWriteStatus("✗ FILE WRITE FAILED: empty path"); return; }
+
+        try {
+            Path file=safeResolve(workspace,relative);
+            if(file.getParent()!=null) Files.createDirectories(file.getParent());
+
+            Files.writeString(file,normalizeGeneratedFileContent(content),
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE);
+
+            streamedWrittenFiles.add(file.toAbsolutePath().normalize().toString());
+            showFileWriteStatus("✓ FILE WRITTEN: "+file);
+            SwingUtilities.invokeLater(this::refreshWorkspace);
+        } catch(Exception e) {
+            showFileWriteStatus("✗ FILE WRITE FAILED: "+relative+" -> "+e.getMessage());
+        }
+    }
+
+    private void showFileWriteStatus(String message) {
+        SwingUtilities.invokeLater(()->{
+            statusLabel.setText(message);
+            operationLabel.setText(message);
         });
+    }
+
+    private void appendStreamingText(String text) {
+        if (text == null || text.isEmpty()) return;
+
+        streamedFileBuffer.append(text);
+        processStreamingFileBlocks();
+
+        SwingUtilities.invokeLater(() -> {
+            if (!cancelRequested) {
+                chatArea.append(text);
+                chatArea.setCaretPosition(chatArea.getDocument().getLength());
+                operationLabel.setText("LLM is generating...  "
+                        + formatElapsed(System.currentTimeMillis()
+                        - operationStartMillis));
+            }
+        });
+    }
+
+    private static final class FileWriteResult {
+        final List<Path> files = new ArrayList<>();
+        final List<String> errors = new ArrayList<>();
+        int count() { return files.size(); }
+    }
+
+    private FileWriteResult writeFileBlocksSafe(String response, Path workspace) {
+        FileWriteResult result = new FileWriteResult();
+
+        if (response == null || response.isBlank()) {
+            result.errors.add("LLM returned an empty response.");
+            return result;
+        }
+
+        Matcher matcher = FILE_BLOCK_PATTERN.matcher(response);
+        int blocks = 0;
+
+        while (matcher.find()) {
+            blocks++;
+
+            String relative = matcher.group(1).trim();
+            String content = matcher.group(2);
+
+            // Strip accidental quotes around the path.
+            relative = relative.replaceAll("^[\"'`]+|[\"'`]+$", "").trim();
+
+            if (relative.isEmpty()) {
+                result.errors.add("FILE block #" + blocks + " has an empty path.");
+                continue;
+            }
+
+            try {
+                Path file = safeResolve(workspace, relative);
+
+                Path parent = file.getParent();
+                if (parent != null) {
+                    Files.createDirectories(parent);
+                }
+
+                Files.writeString(
+                        file,
+                        normalizeGeneratedFileContent(content),
+                        StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.WRITE);
+
+                result.files.add(file);
+
+            } catch (Exception e) {
+                result.errors.add(relative + " -> " + e.getMessage());
+            }
+        }
+
+        if (blocks == 0) {
+            result.errors.add(
+                    "No FILE blocks were found in the LLM response. "
+                    + "The model must use <<<FILE:path>>> ... <<<END_FILE>>> "
+                    + "for direct file generation.");
+        }
+
+        return result;
+    }
+
+    private String normalizeGeneratedFileContent(String content) {
+        if (content == null) return "";
+
+        String result = content;
+
+        // Remove only an accidental fence surrounding the entire block.
+        result = result.replaceFirst(
+                "(?s)^\\\\s*```(?:[A-Za-z0-9_+.#-]+)?\\\\s*\\\\R", "");
+        result = result.replaceFirst(
+                "(?s)\\\\R\\\\s*```\\\\s*$", "");
+
+        // Remove an accidental leading/trailing blank line.
+        return result.replaceFirst("^\\\\s*\\\\R", "")
+                .replaceFirst("\\\\R\\\\s*$", "\\\\n");
+    }
+
+    private String removeFileBlocksForChat(String response) {
+        if (response == null) return "";
+
+        Matcher matcher = FILE_BLOCK_PATTERN.matcher(response);
+        String cleaned = matcher.replaceAll("");
+
+        return cleaned.replaceAll("\\\\n{3,}", "\\\\n\\\\n").trim();
+    }
+
+    private void removeLastStreamingOutput() {
+        // Streaming output is appended as plain text to the Swing chat component.
+        // Rebuild it from the conversation history so raw FILE blocks disappear.
+        StringBuilder html = new StringBuilder();
+        html.append("<html><body>");
+
+        for (Map<String, String> message : messages) {
+            String role = message.get("role");
+            String content = message.get("content");
+
+            if ("user".equals(role)) {
+                html.append("<p><b>YOU</b></p>");
+                html.append("<p>").append(htmlEscape(content)).append("</p>");
+            } else if ("assistant".equals(role)) {
+                html.append("<p><b>LOCAL LLM</b></p>");
+                html.append("<p>").append(htmlEscape(removeFileBlocksForChat(content))
+                        .replace("\n", "<br>")).append("</p>");
+            }
+        }
+
+        html.append("</body></html>");
+
+        chatArea.setText(html.toString());
+        chatArea.setCaretPosition(chatArea.getDocument().getLength());
+    }
+
+    private String htmlEscape(String text) {
+        if (text == null) return "";
+        return text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&#39;");
     }
 
     // ---------- File generation ----------
@@ -828,7 +1278,8 @@ public class LocalLLMSwingAgentV6 extends JFrame {
         StringBuilder result = new StringBuilder(userMessage);
         result.append("\n\n===== USER ATTACHED FILES =====\n");
 
-        int remaining = MAX_CONTEXT_CHARS;
+        int attachmentTokenBudget = getAttachmentTokenBudget();
+        int remaining = tokenBudgetToChars(attachmentTokenBudget);
 
         for (Path file : attachedFiles) {
             if (remaining <= 0) {
@@ -849,7 +1300,7 @@ public class LocalLLMSwingAgentV6 extends JFrame {
                 }
 
                 String content = extractAttachment(file);
-                int allowance = Math.min(remaining, 400_000);
+                int allowance = Math.min(remaining, Math.max(1024, tokenBudgetToChars(Math.max(256, attachmentTokenBudget / 4))));
                 content = truncateAttachment(content, allowance);
 
                 String block = "\n===== FILE: " + file + " =====\n"
@@ -1337,6 +1788,7 @@ public class LocalLLMSwingAgentV6 extends JFrame {
                         }
                     } else if (!ids.isEmpty()) {
                         modelCombo.setSelectedIndex(0);
+        refreshModelContext((String) modelCombo.getSelectedItem());
                         modelField.setText(ids.get(0));
                     }
 
@@ -1701,7 +2153,7 @@ public class LocalLLMSwingAgentV6 extends JFrame {
             } catch (Exception ignored) {
             }
 
-            LocalLLMSwingAgentV6 app = new LocalLLMSwingAgentV6();
+            LocalLLMSwingAgentV10 app = new LocalLLMSwingAgentV10();
             app.setVisible(true);
         });
     }
