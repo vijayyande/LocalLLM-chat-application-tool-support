@@ -1,3 +1,12 @@
+
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.file.FileVisitResult;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import javax.swing.*;
 import javax.imageio.ImageIO;
 import javax.swing.border.EmptyBorder;
@@ -64,9 +73,9 @@ import java.util.regex.Pattern;
  *
  * The application writes the file directly beneath the selected workspace.
  */
-public class LocalLLMSwingAgentV19 extends JFrame {
+public class LocalLLMFullChatV26 extends JFrame {
 
-    private static final String APP_VERSION = "19.0";
+    private static final String APP_VERSION = "26.0";
 
     // ---------- UI ----------
     private final JEditorPane chatArea = new JEditorPane();
@@ -135,6 +144,19 @@ public class LocalLLMSwingAgentV19 extends JFrame {
     private final JButton refreshModelsButton = new JButton("Models");
     private final JComboBox<String> modelCombo = new JComboBox<>();
 
+
+    // ---------- V24 full-chat services ----------
+    private final SessionStoreV24 sessionStore = new SessionStoreV24();
+    private final ProjectIndexerV24 projectIndexer = new ProjectIndexerV24();
+    private final ToolExecutorV24 toolExecutor = new ToolExecutorV24();
+    private final DiffManagerV24 diffManager = new DiffManagerV24();
+
+    private volatile ChatSessionV24 activeSession;
+    private volatile boolean autoApplyGeneratedFiles = true;
+    private volatile boolean autoIncludeGeneratedFiles = true;
+    private volatile boolean projectIndexEnabled = true;
+    private volatile boolean commandExecutionEnabled = false;
+
     // ---------- State ----------
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20))
@@ -154,7 +176,7 @@ public class LocalLLMSwingAgentV19 extends JFrame {
      * the user's home directory.
      *
      * For a JAR launched as:
-     *   C:\Download\LocalLLM\LocalLLMSwingAgentV19.jar
+     *   C:\Download\LocalLLM\LocalLLMFullChatV26.jar
      *
      * the configuration will be:
      *   C:\Download\LocalLLM\.localllm-swing-agent.properties
@@ -170,8 +192,23 @@ public class LocalLLMSwingAgentV19 extends JFrame {
             Collections.synchronizedSet(new LinkedHashSet<>());
     private volatile Path loadedSessionWorkspace;
 
+    // Generated files are prepared in the background after each generation.
+    // The cache is an optimization only; files are re-read from disk before
+    // every actual chat request so external edits are always picked up.
+    private final Map<String, String> backgroundFileContext =
+            Collections.synchronizedMap(new LinkedHashMap<>());
+    private volatile CompletableFuture<?> backgroundContextWorker;
+
     private volatile boolean busy = false;
     private volatile boolean cancelRequested = false;
+
+    // Animated activity indicator. It runs independently of the LLM worker
+    // so the user always has visual feedback that the application is alive.
+    private javax.swing.Timer activityAnimationTimer;
+    private int activityAnimationFrame = 0;
+    private final String[] activityFrames = {
+            "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
+    };
     private volatile java.net.http.HttpRequest currentRequest;
     private volatile CompletableFuture<?> currentWorker;
 
@@ -215,8 +252,8 @@ public class LocalLLMSwingAgentV19 extends JFrame {
             "<<<FILE\\s*:\\s*(.*?)\\s*>>>\\s*\\R([\\s\\S]*?)\\R\\s*<<<END_FILE\\s*>>>",
             Pattern.MULTILINE);
 
-    public LocalLLMSwingAgentV19() {
-        super("Local LLM Swing Agent v19.0");
+    public LocalLLMFullChatV26() {
+        super("Local LLM Full Chat Agent v26.0");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setMinimumSize(new Dimension(1200, 780));
         setLocationRelativeTo(null);
@@ -227,6 +264,7 @@ public class LocalLLMSwingAgentV19 extends JFrame {
 
         buildUi();
         installConfigurationPersistence();
+        initializeFullChatFeaturesV24();
         saveConfiguration();
 
         appendSystem("Local LLM agent v" + APP_VERSION + " started. Configure the endpoint/model and select a workspace.");
@@ -236,13 +274,14 @@ public class LocalLLMSwingAgentV19 extends JFrame {
 
         // Load the hidden persistent session for the selected workspace.
         loadSessionForWorkspace(getWorkspace());
+        prepareGeneratedFilesInBackground();
 }
 
 
     private Path resolveApplicationDirectory() {
         try {
             // When running from a JAR, CodeSource points to the actual JAR.
-            URI location = LocalLLMSwingAgentV19.class
+            URI location = LocalLLMFullChatV26.class
                     .getProtectionDomain()
                     .getCodeSource()
                     .getLocation()
@@ -803,6 +842,23 @@ public class LocalLLMSwingAgentV19 extends JFrame {
         }
     }
 
+
+    private void initializeFullChatFeaturesV24() {
+        Path workspace = getWorkspaceForWorker();
+        if (workspace != null) {
+            activeSession = sessionStore.loadOrCreate(workspace, getModel());
+            if (projectIndexEnabled) projectIndexer.indexAsync(workspace);
+        }
+
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowClosing(java.awt.event.WindowEvent e) {
+                try {
+                    if (activeSession != null) sessionStore.save(activeSession);
+                } catch (Exception ignored) {}
+            }
+        });
+    }
+
     private void buildUi() {
         JPanel root = new JPanel(new BorderLayout(8, 8));
         root.setBorder(new EmptyBorder(8, 8, 8, 8));
@@ -1103,13 +1159,168 @@ public class LocalLLMSwingAgentV19 extends JFrame {
                 || t.contains("implement the");
     }
 
+
+    private boolean handleSlashCommand(String text) {
+        if (text == null || !text.trim().startsWith("/")) return false;
+
+        String cmd = text.trim();
+        String lower = cmd.toLowerCase(Locale.ROOT);
+
+        if (lower.equals("/clear")) {
+            clearConversation();
+            return true;
+        }
+        if (lower.equals("/new")) {
+            messages.clear();
+            synchronized (streamingChatText) { streamingChatText.setLength(0); }
+            activeSession = null;
+            renderConversationHtml();
+            appendSystem("New chat session started.");
+            return true;
+        }
+        if (lower.equals("/files")) {
+            refreshWorkspace();
+            appendSystem("Workspace file list refreshed.");
+            return true;
+        }
+        if (lower.equals("/context")) {
+            ContextInfo info = detectedContext;
+            appendSystem("Provider: " + info.provider
+                    + "\nModel: " + info.model
+                    + "\nActive context: " + info.activeContext
+                    + "\nMaximum context: " + info.maximumContext
+                    + "\nUsable input: " + info.usableInput(4096)
+                    + "\nSource: " + info.source);
+            return true;
+        }
+        if (lower.equals("/workspace")) {
+            appendSystem("Workspace: " + getWorkspaceForWorker());
+            return true;
+        }
+        if (lower.equals("/model")) {
+            appendSystem("Model: " + getModel()
+                    + "\nEndpoint: " + endpointField.getText().trim());
+            return true;
+        }
+        if (lower.equals("/index")) {
+            Path ws = getWorkspaceForWorker();
+            if (ws != null) {
+                projectIndexer.indexAsync(ws);
+                appendSystem("Project indexing started in background.");
+            }
+            return true;
+        }
+        if (lower.equals("/compact")) {
+            compactConversation();
+            return true;
+        }
+        if (lower.equals("/retry")) {
+            for (int i=messages.size()-1; i>=0; i--) {
+                if ("user".equals(messages.get(i).get("role"))) {
+                    inputArea.setText(messages.get(i).get("content"));
+                    sendMessage();
+                    break;
+                }
+            }
+            return true;
+        }
+        if (lower.startsWith("/search ")) {
+            String q=cmd.substring(8).trim();
+            appendSystem("Project search: " + projectIndexer.search(q).toString());
+            return true;
+        }
+        if (lower.equals("/help")) {
+            appendSystem(
+                "/new - new chat\n/clear - clear current chat\n/files - refresh workspace\n"
+              + "/context - show model context\n/model - show provider/model\n"
+              + "/workspace - show workspace\n/index - rebuild project index\n"
+              + "/search <text> - search indexed project files\n/compact - keep recent messages\n"
+              + "/retry - retry last user message");
+            return true;
+        }
+        return false;
+    }
+
+    private void compactConversation() {
+        if (messages.size() <= 8) {
+            appendSystem("Conversation is already compact.");
+            return;
+        }
+        List<Map<String,String>> recent =
+                new ArrayList<>(messages.subList(Math.max(0,messages.size()-8),messages.size()));
+        messages.clear();
+        messages.addAll(recent);
+        renderConversationHtml();
+        appendSystem("Conversation compacted; recent messages retained.");
+    }
+
+
+    private void startActivityAnimation(String message) {
+        SwingUtilities.invokeLater(() -> {
+            activityAnimationFrame = 0;
+
+            if (activityAnimationTimer != null) {
+                activityAnimationTimer.stop();
+            }
+
+            activityAnimationTimer = new javax.swing.Timer(100, e -> {
+                String frame = activityFrames[
+                        activityAnimationFrame++ % activityFrames.length];
+
+                operationLabel.setText(frame + "  " + message);
+
+                if (statusLabel != null) {
+                    statusLabel.setText(
+                            frame + "  " + message);
+                }
+            });
+
+            activityAnimationTimer.setRepeats(true);
+            activityAnimationTimer.start();
+
+            operationLabel.setText(
+                    activityFrames[0] + "  " + message);
+            statusLabel.setText(
+                    activityFrames[0] + "  " + message);
+        });
+    }
+
+    private void stopActivityAnimation(String message) {
+        SwingUtilities.invokeLater(() -> {
+            if (activityAnimationTimer != null) {
+                activityAnimationTimer.stop();
+                activityAnimationTimer = null;
+            }
+
+            operationLabel.setText(message);
+            statusLabel.setText(message);
+        });
+    }
+
+    private void setActivity(String message) {
+        if (busy) {
+            startActivityAnimation(message);
+        } else {
+            SwingUtilities.invokeLater(() -> {
+                operationLabel.setText(message);
+                statusLabel.setText(message);
+            });
+        }
+    }
+
     private void sendMessage() {
         if (busy) return;
 
         saveConfiguration();
+        startActivityAnimation("Preparing request...");
 
         String text = inputArea.getText().trim();
         if (text.isEmpty()) return;
+
+        if (handleSlashCommand(text)) {
+            inputArea.setText("");
+            return;
+        }
 
         String model = getModel();
         if (model.isBlank()) {
@@ -1125,14 +1336,21 @@ public class LocalLLMSwingAgentV19 extends JFrame {
         if (workspace == null) return;
 
         loadSessionForWorkspace(workspace);
+        activeSession = sessionStore.loadOrCreate(workspace, model);
+        activeSession.addUserMessage(text);
+        activeSession.setEndpoint(endpointField.getText().trim());
+        sessionStore.save(activeSession);
 
         inputArea.setText("");
         String messageWithAttachments = buildMessageWithAttachments(text);
-        if (looksLikeFileGenerationRequest(text)) {
-            messageWithAttachments += "\n\nSYSTEM AGENT NOTE: This request requires direct local file generation. "
-                    + "Do NOT paste generated source files as ordinary chat content. "
-                    + "Emit each file using <<<FILE:relative/path>>> ... <<<END_FILE>>>."; 
-        }
+        messageWithAttachments += "\n\nSYSTEM AGENT FILE HANDLING RULES: "
+                + "When creating, modifying, or updating any local file, write the file "
+                + "directly using exactly <<<FILE:relative/path>>> ... <<<END_FILE>>>. "
+                + "Do NOT rely on markdown code fences for files. "
+                + "The desktop agent writes every FILE block directly into the selected workspace. "
+                + "In the chat UI, every generated FILE block is shown as a collapsed file control; "
+                + "the user can click it to expand and inspect its contents. "
+                + "For normal discussion that does not require a file, respond normally.";
         appendUser(messageWithAttachments);
         addMessage("user", messageWithAttachments);
         cancelRequested = false;
@@ -1153,7 +1371,11 @@ public class LocalLLMSwingAgentV19 extends JFrame {
                         return;
                     }
 
-                    FileWriteResult fileResult = writeFileBlocksSafe(response, workspace);
+                    // Direct-to-disk processing is unconditional: every FILE block
+                    // returned by the local LLM is written immediately to the selected
+                    // workspace before the assistant response is rendered.
+                    FileWriteResult fileResult =
+                            writeFileBlocksSafe(response, workspace);
 
                     String chatResponse = removeFileBlocksForChat(response);
 
@@ -1181,6 +1403,12 @@ public class LocalLLMSwingAgentV19 extends JFrame {
 
                         chatResponse += "\nWorkspace: " + workspace;
                         refreshWorkspace();
+                        if (projectIndexEnabled) projectIndexer.indexAsync(workspace);
+
+                        // Prepare all generated files off the EDT so the next
+                        // user message already has them available as hidden
+                        // context without requiring manual attachment.
+                        prepareGeneratedFilesInBackground();
                     }
 
                     if (fileResult.errors.size() > 0) {
@@ -1193,6 +1421,13 @@ public class LocalLLMSwingAgentV19 extends JFrame {
                     // Store the complete response for future conversation context,
                     // but display only the human-readable response and file summary.
                     addMessage("assistant", response);
+                    if (activeSession != null) {
+                        activeSession.addAssistantMessage(response);
+                        activeSession.setModel(model);
+                        activeSession.setEndpoint(endpointField.getText().trim());
+                        activeSession.setWorkspace(workspace);
+                        sessionStore.save(activeSession);
+                    }
 
                     synchronized (streamingChatText) {
                         streamingChatText.setLength(0);
@@ -1465,9 +1700,12 @@ public class LocalLLMSwingAgentV19 extends JFrame {
 
             // Start the visible assistant output immediately.
             SwingUtilities.invokeAndWait(() -> {
-                appendStreamingTextToChat("\n\nLOCAL LLM\n----------------------------------------\n");
+                synchronized (streamingChatText) {
+                    streamingChatText.append("\n\nLOCAL LLM\n----------------------------------------\n");
+                }
+                renderConversationHtml();
                 chatArea.setCaretPosition(chatArea.getDocument().getLength());
-                operationLabel.setText("Connected. Receiving first token...");
+                operationLabel.setText("● Receiving response...");
             });
 
             try (BufferedReader reader = new BufferedReader(
@@ -1500,6 +1738,15 @@ public class LocalLLMSwingAgentV19 extends JFrame {
                         if (delta != null && !delta.isEmpty()) {
                             completeResponse.append(delta);
                             appendStreamingText(delta);
+
+                            // Reset/update activity feedback while tokens are
+                            // arriving. The timer continues animating between
+                            // token bursts, so slow models remain visibly alive.
+                            if (busy) {
+                                SwingUtilities.invokeLater(() ->
+                                        operationLabel.setToolTipText(
+                                                "Receiving streamed LLM output..."));
+                            }
                         }
                     }
                 }
@@ -1526,6 +1773,9 @@ public class LocalLLMSwingAgentV19 extends JFrame {
 
         } finally {
             currentRequest = null;
+            if (cancelRequested) {
+                stopActivityAnimation("Operation cancelled.");
+            }
         }
     }
 
@@ -1694,6 +1944,7 @@ public class LocalLLMSwingAgentV19 extends JFrame {
         if (normalized.equals(loadedSessionWorkspace)) return;
 
         sessionGeneratedFiles.clear();
+        backgroundFileContext.clear();
         loadedSessionWorkspace = normalized;
 
         Path sessionFile = normalized.resolve(SESSION_FILE_NAME);
@@ -1801,12 +2052,95 @@ public class LocalLLMSwingAgentV19 extends JFrame {
      * manually edits a generated file between messages, the LLM sees the
      * current contents rather than stale contents from the previous response.
      */
+    /**
+     * Prepares all generated/session files in the background.
+     *
+     * This does NOT send a fake chat request to the LLM. OpenAI-compatible
+     * local APIs are stateless per request, so sending a background "sync"
+     * request would merely waste tokens and could cause an unwanted response.
+     *
+     * Instead, the files are read/prepared off the Swing EDT. The complete,
+     * current file contents are still submitted as hidden context with the
+     * next real user message.
+     */
+    private void prepareGeneratedFilesInBackground() {
+        Path workspace = getWorkspaceForWorker();
+        if (workspace == null) return;
+
+        loadSessionForWorkspace(workspace);
+
+        CompletableFuture<?> old = backgroundContextWorker;
+        if (old != null && !old.isDone()) {
+            // Do not interrupt an active preparation. A newer preparation will
+            // run after the current one and will read the latest disk contents.
+        }
+
+        backgroundContextWorker = CompletableFuture.runAsync(() -> {
+            Map<String, String> prepared = new LinkedHashMap<>();
+
+            List<String> files;
+            synchronized (sessionGeneratedFiles) {
+                files = new ArrayList<>(sessionGeneratedFiles);
+            }
+            Collections.sort(files);
+
+            for (String relative : files) {
+                try {
+                    Path file = safeResolve(workspace, relative);
+                    if (!Files.isRegularFile(file)) continue;
+
+                    // Only text/code files are useful as prompt context.
+                    // Binary attachments are handled separately by the
+                    // attachment pipeline.
+                    if (!isPromptTextFile(file)) continue;
+
+                    prepared.put(relative, readSessionFileContent(file));
+                } catch (Exception ignored) {
+                }
+            }
+
+            synchronized (backgroundFileContext) {
+                backgroundFileContext.clear();
+                backgroundFileContext.putAll(prepared);
+            }
+        });
+    }
+
+    private boolean isPromptTextFile(Path file) {
+        String name = file.getFileName().toString().toLowerCase(Locale.ROOT);
+
+        String[] textExtensions = {
+            ".java", ".kt", ".kts", ".scala", ".groovy",
+            ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp",
+            ".cs", ".go", ".rs", ".swift", ".m", ".mm",
+            ".js", ".jsx", ".ts", ".tsx", ".vue",
+            ".py", ".rb", ".php", ".pl", ".sh", ".bat", ".cmd",
+            ".sql", ".html", ".htm", ".css", ".scss", ".less",
+            ".xml", ".json", ".yaml", ".yml", ".properties",
+            ".toml", ".ini", ".cfg", ".conf", ".md", ".txt",
+            ".gradle", ".gradlew", ".mvn", ".gitignore",
+            ".dockerfile", ".env", ".csv"
+        };
+
+        for (String ext : textExtensions) {
+            if (name.endsWith(ext)) return true;
+        }
+
+        // Common extensionless source/config files.
+        return name.equals("pom.xml")
+                || name.equals("dockerfile")
+                || name.equals("makefile")
+                || name.equals("readme");
+    }
+
     private String buildHiddenSessionContext() {
         Path workspace = getWorkspaceForWorker();
         if (workspace == null) return "";
 
         loadSessionForWorkspace(workspace);
 
+        // Files are pre-read in the background after generation. For correctness,
+        // the actual request below still reads the latest bytes from disk.
         StringBuilder context = new StringBuilder();
 
         context.append(
@@ -2622,36 +2956,155 @@ public class LocalLLMSwingAgentV19 extends JFrame {
         JFileChooser chooser = new JFileChooser(workspaceField.getText());
         chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
-            workspaceField.setText(chooser.getSelectedFile().getAbsolutePath());
+            String selectedWorkspace =
+                    chooser.getSelectedFile().getAbsolutePath();
+
+            workspaceField.setText(selectedWorkspace);
+
+            // Immediately switch the active workspace and refresh the left
+            // file pane. Do this synchronously on the EDT for the visible UI,
+            // then reload the hidden session context for the new workspace.
+            refreshWorkspace();
+
             saveConfiguration();
             loadSessionForWorkspace(getWorkspaceForWorker());
-            refreshWorkspace();
+            prepareGeneratedFilesInBackground();
+            loadSessionForWorkspace(getWorkspaceForWorker());
         }
     }
 
+    private volatile CompletableFuture<?> workspaceScanWorker;
+    private volatile boolean workspaceScanCancelRequested = false;
+
+    /**
+     * Workspace scanning is deliberately asynchronous. Files.walk() on a large
+     * source tree can take seconds or minutes (network drives, node_modules,
+     * .git, generated build trees), and doing it on the Swing EDT makes the
+     * entire application appear hung.
+     */
     private void refreshWorkspace() {
         Path workspace;
         try {
-            workspace = Paths.get(workspaceField.getText().trim()).toAbsolutePath().normalize();
-            if (!Files.isDirectory(workspace)) return;
+            workspace = Paths.get(workspaceField.getText().trim())
+                    .toAbsolutePath().normalize();
+            if (!Files.isDirectory(workspace)) {
+                SwingUtilities.invokeLater(() ->
+                        operationLabel.setText("Workspace folder does not exist."));
+                return;
+            }
         } catch (Exception e) {
+            SwingUtilities.invokeLater(() ->
+                    operationLabel.setText("Invalid workspace path."));
             return;
         }
 
-        fileListModel.clear();
+        CompletableFuture<?> old = workspaceScanWorker;
+        workspaceScanCancelRequested = true;
+        if (old != null && !old.isDone()) old.cancel(true);
+        workspaceScanCancelRequested = false;
 
-        try {
-            Files.walk(workspace)
-                    .filter(Files::isRegularFile)
-                    .filter(p -> !isHiddenBuildDirectory(workspace.relativize(p)))
-                    .sorted()
-                    .limit(5000)
-                    .forEach(p -> fileListModel.addElement(
-                            workspace.relativize(p).toString()));
-        } catch (IOException e) {
-            appendSystem("Could not scan workspace: " + e.getMessage());
-        }
+        final Path scanRoot = workspace;
+        SwingUtilities.invokeLater(() -> {
+            fileListModel.clear();
+            operationLabel.setText("Scanning workspace in background...");
+            statusLabel.setText("Scanning workspace...");
+        });
+
+        workspaceScanWorker = CompletableFuture.runAsync(() -> {
+            List<String> batch = new ArrayList<>(100);
+            int[] count = {0};
+
+            try {
+                Files.walkFileTree(scanRoot, new SimpleFileVisitor<Path>() {
+                    @Override
+                    public FileVisitResult preVisitDirectory(Path dir,
+                            BasicFileAttributes attrs) {
+                        if (workspaceScanCancelRequested ||
+                                Thread.currentThread().isInterrupted()) {
+                            return FileVisitResult.TERMINATE;
+                        }
+
+                        Path rel;
+                        try {
+                            rel = scanRoot.relativize(dir);
+                        } catch (Exception e) {
+                            return FileVisitResult.SKIP_SUBTREE;
+                        }
+
+                        if (!rel.toString().isEmpty() &&
+                                isHiddenBuildDirectory(rel)) {
+                            return FileVisitResult.SKIP_SUBTREE;
+                        }
+
+                        return FileVisitResult.CONTINUE;
+                    }
+
+                    @Override
+                    public FileVisitResult visitFile(Path file,
+                            BasicFileAttributes attrs) {
+                        if (workspaceScanCancelRequested ||
+                                Thread.currentThread().isInterrupted()) {
+                            return FileVisitResult.TERMINATE;
+                        }
+
+                        if (attrs.isRegularFile()) {
+                            try {
+                                Path rel = scanRoot.relativize(file);
+                                if (!isHiddenBuildDirectory(rel)) {
+                                    batch.add(rel.toString());
+                                    count[0]++;
+
+                                    if (batch.size() >= 100) {
+                                        publishWorkspaceFileBatch(
+                                                new ArrayList<>(batch));
+                                        batch.clear();
+                                    }
+
+                                    // Keep the left pane useful even for very
+                                    // large repositories.
+                                    if (count[0] >= 10000) {
+                                        return FileVisitResult.TERMINATE;
+                                    }
+                                }
+                            } catch (Exception ignored) {
+                            }
+                        }
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
+
+                if (!batch.isEmpty()) {
+                    publishWorkspaceFileBatch(new ArrayList<>(batch));
+                }
+
+                SwingUtilities.invokeLater(() -> {
+                    stopActivityAnimation("Workspace scan complete: "
+                            + count[0] + " files.");
+                    statusLabel.setText("Workspace: " + count[0] + " files");
+                });
+
+            } catch (Exception e) {
+                SwingUtilities.invokeLater(() -> {
+                    stopActivityAnimation("Workspace scan failed.");
+                    statusLabel.setText("Workspace scan failed");
+                    appendSystem("Could not scan workspace: " + e.getMessage());
+                });
+            }
+        });
     }
+
+    private void publishWorkspaceFileBatch(List<String> batch) {
+        SwingUtilities.invokeLater(() -> {
+            for (String file : batch) {
+                if (!fileListModel.contains(file)) {
+                    fileListModel.addElement(file);
+                }
+            }
+            statusLabel.setText("Workspace: "
+                    + fileListModel.size() + " files scanned...");
+        });
+    }
+
 
     private boolean isHiddenBuildDirectory(Path relative) {
         for (Path p : relative) {
@@ -2674,42 +3127,61 @@ public class LocalLLMSwingAgentV19 extends JFrame {
             return;
         }
 
-        StringBuilder context = new StringBuilder();
-        context.append("Here are the selected workspace files. Use them as context.\n\n");
+        List<String> files = new ArrayList<>(selected);
 
-        for (String rel : selected) {
-            try {
-                Path file = safeResolve(workspace, rel);
-                long size = Files.size(file);
+        operationLabel.setText("Reading " + files.size() + " selected file(s)...");
 
-                // Avoid accidentally loading huge/binary files.
-                if (size > 2_000_000) {
+        CompletableFuture.runAsync(() -> {
+            Path ws = workspace;
+            StringBuilder context = new StringBuilder();
+            context.append("Here are the selected workspace files. Use them as context.\n\n");
+
+            int processed = 0;
+            for (String rel : files) {
+                try {
+                    if (Thread.currentThread().isInterrupted()) break;
+
+                    Path file = safeResolve(ws, rel);
+                    long size = Files.size(file);
+
+                    if (size > 2_000_000) {
+                        context.append("===== ").append(rel)
+                                .append(" (skipped: >2 MB) =====\n\n");
+                    } else {
+                        byte[] bytes = Files.readAllBytes(file);
+                        if (looksBinary(bytes)) {
+                            context.append("===== ").append(rel)
+                                    .append(" (binary file, content omitted) =====\n\n");
+                        } else {
+                            String content = new String(bytes, StandardCharsets.UTF_8);
+                            context.append("===== ").append(rel).append(" =====\n")
+                                    .append(content)
+                                    .append("\n===== END ").append(rel)
+                                    .append(" =====\n\n");
+                        }
+                    }
+                } catch (Exception e) {
                     context.append("===== ").append(rel)
-                            .append(" (skipped: >2 MB) =====\n\n");
-                    continue;
+                            .append(" ERROR: ").append(e.getMessage())
+                            .append(" =====\n\n");
                 }
 
-                byte[] bytes = Files.readAllBytes(file);
-                if (looksBinary(bytes)) {
-                    context.append("===== ").append(rel)
-                            .append(" (binary file, content omitted) =====\n\n");
-                    continue;
-                }
-
-                String content = new String(bytes, StandardCharsets.UTF_8);
-                context.append("===== ").append(rel).append(" =====\n")
-                        .append(content)
-                        .append("\n===== END ").append(rel).append(" =====\n\n");
-            } catch (Exception e) {
-                context.append("===== ").append(rel)
-                        .append(" ERROR: ").append(e.getMessage())
-                        .append(" =====\n\n");
+                processed++;
+                final int done = processed;
+                SwingUtilities.invokeLater(() ->
+                        operationLabel.setText("Reading selected files: "
+                                + done + "/" + files.size()));
             }
-        }
 
-        inputArea.setText(context.toString());
-        inputArea.requestFocus();
+            SwingUtilities.invokeLater(() -> {
+                inputArea.setText(context.toString());
+                inputArea.setCaretPosition(0);
+                inputArea.requestFocus();
+                stopActivityAnimation("Selected files added to chat.");
+            });
+        });
     }
+
 
     private boolean looksBinary(byte[] data) {
         int sample = Math.min(data.length, 8192);
@@ -2825,7 +3297,29 @@ public class LocalLLMSwingAgentV19 extends JFrame {
             streamingChatText.append(text);
         }
 
-        renderConversationHtml();
+        // Never modify Swing components directly from the network worker.
+        // Queue rendering on the EDT and coalesce rapid token updates.
+        scheduleStreamingChatRender();
+    }
+
+    private volatile boolean streamingRenderPending = false;
+
+    private void scheduleStreamingChatRender() {
+        synchronized (this) {
+            if (streamingRenderPending) return;
+            streamingRenderPending = true;
+        }
+
+        SwingUtilities.invokeLater(() -> {
+            synchronized (this) {
+                streamingRenderPending = false;
+            }
+
+            renderConversationHtml();
+            if (chatArea != null) {
+                chatArea.setCaretPosition(chatArea.getDocument().getLength());
+            }
+        });
     }
 
     private void renderConversationHtml() {
@@ -2843,7 +3337,7 @@ public class LocalLLMSwingAgentV19 extends JFrame {
                 .append("pre.file-content{margin:0 0 8px 8px;padding:9px;"
                         + "border:1px solid #d0d0d0;background:#fafafa;"
                         + "font-family:Consolas,Monaco,monospace;font-size:12px;}")
-                .append(".streaming{color:#444;}")
+                .append(".streaming{color:#444;white-space:pre-wrap;}")
                 .append("</style></head><body>");
 
         for (Map<String,String> message : messages) {
@@ -3338,8 +3832,199 @@ public class LocalLLMSwingAgentV19 extends JFrame {
             } catch (Exception ignored) {
             }
 
-            LocalLLMSwingAgentV19 app = new LocalLLMSwingAgentV19();
+            LocalLLMFullChatV26 app = new LocalLLMFullChatV26();
             app.setVisible(true);
         });
     }
 }
+
+/* ============================================================================
+ * V24 full-chat support services
+ * ========================================================================== */
+
+final class ChatSessionV24 {
+    private final String id = UUID.randomUUID().toString();
+    private String title = "New Chat";
+    private String model = "";
+    private String endpoint = "";
+    private String workspace = "";
+    private final List<ChatMessageV24> messages = new ArrayList<>();
+
+    String getId(){return id;}
+    String getTitle(){return title;}
+    String getModel(){return model;}
+    String getEndpoint(){return endpoint;}
+    String getWorkspace(){return workspace;}
+    List<ChatMessageV24> getMessages(){return messages;}
+
+    void setModel(String v){model=v==null?"":v;}
+    void setEndpoint(String v){endpoint=v==null?"":v;}
+    void setWorkspace(Path p){workspace=p==null?"":p.toAbsolutePath().normalize().toString();}
+
+    void addUserMessage(String text){
+        messages.add(new ChatMessageV24("user",text,System.currentTimeMillis()));
+        if ("New Chat".equals(title) && text != null && !text.isBlank()) {
+            title=text.replaceAll("\\s+"," ").trim();
+            if(title.length()>60) title=title.substring(0,60)+"...";
+        }
+    }
+
+    void addAssistantMessage(String text){
+        messages.add(new ChatMessageV24("assistant",text,System.currentTimeMillis()));
+    }
+}
+
+final class ChatMessageV24 {
+    final String role, content;
+    final long timestamp;
+    ChatMessageV24(String r,String c,long t){role=r;content=c;timestamp=t;}
+}
+
+final class SessionStoreV24 {
+    private Path root(){
+        return Paths.get(System.getProperty("user.dir"),".localllm-sessions")
+                .toAbsolutePath().normalize();
+    }
+
+    ChatSessionV24 loadOrCreate(Path workspace,String model){
+        ChatSessionV24 s=new ChatSessionV24();
+        s.setWorkspace(workspace);
+        s.setModel(model);
+        return s;
+    }
+
+    void save(ChatSessionV24 s){
+        if(s==null)return;
+        try{
+            Path dir=root();
+            Files.createDirectories(dir);
+            Properties p=new Properties();
+            p.setProperty("id",s.getId());
+            p.setProperty("title",s.getTitle());
+            p.setProperty("model",s.getModel());
+            p.setProperty("endpoint",s.getEndpoint());
+            p.setProperty("workspace",s.getWorkspace());
+            p.setProperty("message.count",Integer.toString(s.getMessages().size()));
+            for(int i=0;i<s.getMessages().size();i++){
+                ChatMessageV24 m=s.getMessages().get(i);
+                p.setProperty("message."+i+".role",m.role);
+                p.setProperty("message."+i+".content",m.content==null?"":m.content);
+                p.setProperty("message."+i+".time",Long.toString(m.timestamp));
+            }
+            try(OutputStream out=Files.newOutputStream(
+                    dir.resolve(s.getId()+".session"),
+                    StandardOpenOption.CREATE,StandardOpenOption.TRUNCATE_EXISTING)){
+                p.store(out,"Local LLM Full Chat V24");
+            }
+        }catch(IOException ignored){}
+    }
+}
+
+final class ProjectIndexerV24 {
+    private final Map<String,List<String>> index=new ConcurrentHashMap<>();
+
+    void indexAsync(Path workspace){
+        if(workspace==null)return;
+        CompletableFuture.runAsync(()->index(workspace));
+    }
+
+    private void index(Path workspace){
+        Map<String,List<String>> local=new LinkedHashMap<>();
+        try{
+            Files.walkFileTree(workspace,new SimpleFileVisitor<Path>(){
+                @Override public FileVisitResult visitFile(Path f,BasicFileAttributes a){
+                    if(isIgnored(f)||!isText(f))return FileVisitResult.CONTINUE;
+                    try{
+                        String rel=workspace.relativize(f).toString();
+                        String text=Files.readString(f,StandardCharsets.UTF_8);
+                        List<String> symbols=new ArrayList<>();
+                        Matcher m=Pattern.compile(
+                            "(?m)\\b(?:class|interface|enum|record|def|function)\\s+([A-Za-z_][A-Za-z0-9_]*)")
+                            .matcher(text);
+                        while(m.find()&&symbols.size()<100)symbols.add(m.group(1));
+                        local.put(rel,symbols);
+                    }catch(Exception ignored){}
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        }catch(Exception ignored){}
+        index.clear();
+        index.putAll(local);
+    }
+
+    List<String> search(String q){
+        if(q==null||q.isBlank())return Collections.emptyList();
+        String x=q.toLowerCase(Locale.ROOT);
+        List<String> r=new ArrayList<>();
+        for(Map.Entry<String,List<String>> e:index.entrySet()){
+            if(e.getKey().toLowerCase(Locale.ROOT).contains(x)
+              ||e.getValue().stream().anyMatch(v->v.toLowerCase(Locale.ROOT).contains(x)))
+                r.add(e.getKey());
+        }
+        return r;
+    }
+
+    private boolean isIgnored(Path p){
+        String s=p.toString().replace('\\','/');
+        return s.contains("/.git/")||s.contains("/target/")
+            ||s.contains("/node_modules/")||s.contains("/build/")||s.contains("/out/");
+    }
+
+    private boolean isText(Path p){
+        String n=p.getFileName().toString().toLowerCase(Locale.ROOT);
+        return n.matches(".*\\.(java|c|h|cpp|hpp|cc|cs|py|js|jsx|ts|tsx|go|rs|kt|kts|swift|sql|xml|json|yaml|yml|properties|md|txt|html|css|scss|gradle)$")
+            ||n.equals("pom.xml")||n.equals("dockerfile")||n.equals("makefile");
+    }
+}
+
+final class DiffManagerV24 {
+    private final Map<Path,String> backups=new ConcurrentHashMap<>();
+
+    void backup(Path file){
+        try{
+            if(Files.isRegularFile(file))
+                backups.put(file.toAbsolutePath().normalize(),
+                    Files.readString(file,StandardCharsets.UTF_8));
+        }catch(IOException ignored){}
+    }
+
+    boolean undo(Path file){
+        String old=backups.get(file.toAbsolutePath().normalize());
+        if(old==null)return false;
+        try{
+            Files.writeString(file,old,StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,StandardOpenOption.TRUNCATE_EXISTING);
+            return true;
+        }catch(IOException e){return false;}
+    }
+}
+
+final class ToolExecutorV24 {
+    private final ExecutorService executor=Executors.newCachedThreadPool();
+
+    CompletableFuture<String> runCommand(Path workspace,String command){
+        return CompletableFuture.supplyAsync(()->{
+            if(workspace==null)return "ERROR: workspace not configured";
+            try{
+                boolean win=System.getProperty("os.name","").toLowerCase(Locale.ROOT).contains("win");
+                ProcessBuilder pb=win
+                    ?new ProcessBuilder("cmd.exe","/c",command)
+                    :new ProcessBuilder("bash","-lc",command);
+                pb.directory(workspace.toFile());
+                pb.redirectErrorStream(true);
+                Process p=pb.start();
+                StringBuilder out=new StringBuilder();
+                try(BufferedReader br=new BufferedReader(new InputStreamReader(
+                        p.getInputStream(),StandardCharsets.UTF_8))){
+                    String line;
+                    while((line=br.readLine())!=null){
+                        out.append(line).append('\n');
+                        if(out.length()>200000){out.append("[output truncated]\\n");break;}
+                    }
+                }
+                return "Exit code: "+p.waitFor()+"\n"+out;
+            }catch(Exception e){return "ERROR: "+e.getMessage();}
+        },executor);
+    }
+}
+

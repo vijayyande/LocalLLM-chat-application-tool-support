@@ -22,5 +22,7 @@ del *.class
 echo running %filename%.jar
 java -jar %filename%.jar
 
-pause
+
+echo Waiting for 5 seconds...
+timeout /t 5 /nobreak >nul
 
